@@ -1,7 +1,7 @@
 /*
  *  acpi.c - Linux ACPI driver
  *
- *  Copyright (C) 1999 Andrew Henroid
+ *  Copyright (C) 1999-2000 Andrew Henroid
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -55,6 +55,11 @@ static int acpi_do_ulong(ctl_table *ctl,
 			 struct file *file,
 			 void *buffer,
 			 size_t *len);
+static int acpi_do_table(ctl_table *ctl,
+			 int write,
+			 struct file *file,
+			 void *buffer,
+			 size_t *len);
 static int acpi_do_event_reg(ctl_table *ctl,
 			     int write,
 			     struct file *file,
@@ -72,12 +77,6 @@ static int acpi_do_sleep(ctl_table *ctl,
 			 size_t *len);
 
 static struct ctl_table_header *acpi_sysctl = NULL;
-
-static struct acpi_facp *acpi_facp = NULL;
-static int acpi_fake_facp = 0;
-static struct acpi_facs *acpi_facs = NULL;
-static unsigned long acpi_facp_addr = 0;
-static unsigned long acpi_dsdt_addr = 0;
 
 // current system sleep state (S0 - S4)
 static acpi_sstate_t acpi_sleep_state = ACPI_S0;
@@ -104,13 +103,64 @@ static int acpi_p_lvl3_tested = 0;
 
 enum
 {
-	ACPI_ENABLED,
-	ACPI_TABLES_ONLY,
-	ACPI_CHIPSET_ONLY,
-	ACPI_DISABLED,
+	ACPI_ENABLED =       0x00000000, // use ACPI if present
+	ACPI_DISABLED =      0x00000001, // never use ACPI
+	ACPI_TABLES_ONLY =   0x00000002, // never use chipset-specific driver
+	ACPI_CHIPSET_ONLY =  0x00000004, // always use chipset-specific driver
+	ACPI_IGNORE_ERRATA = 0x00000008, // ignore any listed platform errata
+	ACPI_COPY_TABLES  =  0x00000010, // copy ACPI tables before use
+	ACPI_TRUST_TABLES =  0x00000020, // use tables even after ioremap fails
+	ACPI_SCI_DISABLED =  0x00000040, // never enable ACPI (info. only)
+	ACPI_C2_DISABLED  =  0x00000080, // never enter C2
+	ACPI_C3_DISABLED  =  0x00000100, // never enter C3
+	ACPI_S1_DISABLED  =  0x00000200, // never enter S1
+	ACPI_S5_DISABLED  =  0x00000400, // never enter S5
 };
 
-static int acpi_enabled = ACPI_ENABLED;
+struct acpi_option_info
+{
+	const char *name;
+	unsigned long value;
+};
+
+static struct acpi_option_info acpi_options[] =
+{
+	{"on", ACPI_ENABLED},
+	{"off", ACPI_DISABLED},
+	{"tables", ACPI_TABLES_ONLY},
+	{"chipset", ACPI_CHIPSET_ONLY},
+	{"no-errata", ACPI_IGNORE_ERRATA},
+	{"copy-tables", ACPI_COPY_TABLES},
+	{"trust-tables", ACPI_TRUST_TABLES},
+	{"no-sci", ACPI_SCI_DISABLED},
+	{"no-c2", ACPI_C2_DISABLED},
+	{"no-c3", ACPI_C3_DISABLED},
+	{"no-s1", ACPI_S1_DISABLED},
+	{"no-s5", ACPI_S5_DISABLED},
+	{NULL, 0},
+};
+
+static unsigned long acpi_opts = ACPI_ENABLED;
+
+struct acpi_errata_info
+{
+	const char *signature; // table signature (eg. "RSDT")
+	const char *oem;       // OEM name
+	const char *oem_table; // OEM table identifier (optional)
+	u32 oem_rev;           // OEM table revision (optional)
+	unsigned long options; // errata options
+};
+
+/*
+ * We must identify systems that need ACPI_TRUST_TABLES solely from the
+ * RSDP ("RSD PTR ").  All other options should be flagged from the
+ * RSDT ("RSDT") which can be better identified.
+ */
+struct acpi_errata_info acpi_errata[] =
+{
+	{"RSD PTR ", "AMI   ", NULL, 0, ACPI_TRUST_TABLES | ACPI_COPY_TABLES},
+	{NULL, NULL, 0, 0},
+};
 
 // bits 8-15 are SLP_TYPa, bits 0-7 are SLP_TYPb
 static unsigned long acpi_slp_typ[] = 
@@ -123,15 +173,28 @@ static unsigned long acpi_slp_typ[] =
 	ACPI_SLP_TYP_DISABLED  /* S5 */
 };
 
+struct acpi_table_info
+{
+	u32 expected_signature;
+	u32 expected_size;
+
+	struct acpi_table *table;
+	size_t size;
+	int mapped;
+};
+
+static struct acpi_table_info acpi_facp
+	= {ACPI_FACP_SIG, sizeof(struct acpi_facp), NULL, 0, 0};
+static struct acpi_table_info acpi_dsdt = {ACPI_DSDT_SIG, 0, NULL, 0, 0};
+static struct acpi_table_info acpi_facs
+	= {ACPI_FACS_SIG, sizeof(struct acpi_facs), NULL, 0, 0};
+static rwlock_t acpi_do_table_lock = RW_LOCK_UNLOCKED;
+
 static struct ctl_table acpi_table[] =
 {
-	{ACPI_FACP, "facp",
-	 &acpi_facp_addr, sizeof(acpi_facp_addr),
-	 0400, NULL, &acpi_do_ulong},
+	{ACPI_FACP, "facp", &acpi_facp, 0, 0644, NULL, &acpi_do_table},
 
-	{ACPI_DSDT, "dsdt",
-	 &acpi_dsdt_addr, sizeof(acpi_dsdt_addr),
-	 0400, NULL, &acpi_do_ulong},
+	{ACPI_DSDT, "dsdt", &acpi_dsdt, 0, 0644, NULL, &acpi_do_table},
 
 	{ACPI_PM1_ENABLE, "pm1_enable",
 	 NULL, 0,
@@ -159,7 +222,7 @@ static struct ctl_table acpi_table[] =
 	 &acpi_p_lvl3_lat, sizeof(acpi_p_lvl3_lat),
 	 0644, NULL, &acpi_do_ulong},
 
-	{ACPI_P_LVL2_LAT, "enter_lvl2_lat",
+	{ACPI_ENTER_LVL2_LAT, "enter_lvl2_lat",
 	 &acpi_enter_lvl2_lat, sizeof(acpi_enter_lvl2_lat),
 	 0644, NULL, &acpi_do_ulong},
 
@@ -393,6 +456,16 @@ static struct acpi_table *__init acpi_map_table(u32 addr)
 			printk(KERN_ERR
 			       "ACPI: unreserved table memory @ 0x%p!\n",
 			       (void*) addr);
+
+			if (acpi_opts & ACPI_TRUST_TABLES) {
+				/* OK, trust that the table is there
+				 * if it isn't you'll get an OOPS here
+				 */
+				static u32 sig;
+				table = (struct acpi_table *)
+					phys_to_virt(addr);
+				sig = table->signature;
+			}
 		}
 	}
 	return table;
@@ -406,6 +479,97 @@ static void acpi_unmap_table(struct acpi_table *table)
 	// iounmap ignores addresses within physical memory
 	if (table)
 		iounmap(table);
+}
+
+/*
+ * Initialize an ACPI table
+ */
+static int acpi_init_table(struct acpi_table_info *info,
+			   void *data,
+			   int mapped)
+{
+	struct acpi_table *table = (struct acpi_table*) data;
+
+	info->table = NULL;
+	info->size = 0;
+	info->mapped = 0;
+
+	if (!table || table->signature != info->expected_signature)
+		return -EINVAL;
+
+	if (mapped && (acpi_opts & ACPI_COPY_TABLES)) {
+		struct acpi_table *copy
+			= kmalloc(table->length, GFP_KERNEL);
+		if (!copy)
+			return -ENOMEM;
+		memcpy(copy, table, table->length);
+		table = copy;
+		mapped = 0;
+	}
+
+	info->table = table;
+	info->size = (size_t) table->length;
+	info->mapped = mapped;
+	return 0;
+}
+
+/*
+ * Destroy an ACPI table
+ */
+static void acpi_destroy_table(struct acpi_table_info *info)
+{
+	if (info->table) {
+		if (info->mapped)
+			acpi_unmap_table(info->table);
+		else
+			kfree(info->table);
+		info->table = NULL;
+	}
+}
+
+/*
+ * Match ACPI table and set options based on platform errata, if any
+ */
+static int __init acpi_find_errata(struct acpi_table *table)
+{
+	struct acpi_errata_info *info;
+	int size;
+
+	for (info = acpi_errata; info->signature && info->oem; info++) {
+		size = strlen(info->signature);
+		if (memcmp(&table->signature, info->signature, size))
+			continue;
+		if (strcmp(info->signature, "RSD PTR ")) {
+			// ordinary ACPI table
+			size = strlen(info->oem);
+			if (memcmp(table->oem, info->oem, size))
+				continue;
+			if (info->oem_table) {
+				size = strlen(info->oem_table);
+				if (memcmp(table->oem_table,
+					   info->oem_table,
+					   size))
+					continue;
+			}
+			if (info->oem_rev && table->oem_rev != info->oem_rev)
+				continue;
+		}
+		else {
+			// special handling for RSDP
+			size = strlen(info->oem);
+			if (memcmp(((struct acpi_rsdp*) table)->oem,
+				   info->oem,
+				   size))
+				continue;
+		}
+
+		printk(KERN_INFO
+		       "ACPI: found platform errata 0x%08lx\n",
+		       info->options);
+		acpi_opts |= info->options;
+		return 0;
+	}
+	return -1;
 }
 
 /*
@@ -444,53 +608,66 @@ static int __init acpi_find_tables(void)
 	if (i >= ACPI_BIOS_ROM_END)
 		return -ENODEV;
 
+	// find any errata based on the RSDP
+	if (!acpi_find_errata((struct acpi_table*) rsdp)) {
+		if (acpi_opts & ACPI_DISABLED)
+			return -EINVAL;
+		else if (acpi_opts & ACPI_CHIPSET_ONLY)
+			return -ENODEV;
+	}
+
 	// fetch RSDT from RSDP
 	rsdt = acpi_map_table(rsdp->rsdt);
 	if (!rsdt) {
 		printk(KERN_ERR "ACPI: missing RSDT at 0x%p\n",
 		       (void*) rsdp->rsdt);
-		return -ENODEV;
+		return -EINVAL;
 	}
 	else if (rsdt->signature != ACPI_RSDT_SIG) {
 		printk(KERN_ERR "ACPI: bad RSDT at 0x%p (%08x)\n",
 		       (void*) rsdp->rsdt, (unsigned) rsdt->signature);
 		acpi_unmap_table(rsdt);
-		return -ENODEV;
+		return -EINVAL;
 	}
+
+	// find any errata based on the RSDT
+	if (!acpi_find_errata(rsdt)) {
+		if (acpi_opts & ACPI_DISABLED)
+			return -EINVAL;
+		else if (acpi_opts & ACPI_CHIPSET_ONLY)
+			return -ENODEV;
+	}
+
 	// search RSDT for FACP
-	acpi_facp = NULL;
+	acpi_facp.table = NULL;
 	rsdt_entry = (u32 *) (rsdt + 1);
 	rsdt_entry_count = (int) ((rsdt->length - sizeof(*rsdt)) >> 2);
 	while (rsdt_entry_count) {
 		struct acpi_table *dt = acpi_map_table(*rsdt_entry);
-		if (dt && dt->signature == ACPI_FACP_SIG) {
-			acpi_facp = (struct acpi_facp*) dt;
-			acpi_facp_addr = *rsdt_entry;
-			acpi_dsdt_addr = acpi_facp->dsdt;
+		if (!acpi_init_table(&acpi_facp, dt, 1)) {
+			struct acpi_facp *facp
+				= (struct acpi_facp*) acpi_facp.table;
 
-			// map FACS if it exists
-			if (acpi_facp->facs) {
-				dt = acpi_map_table(acpi_facp->facs);
-				if (dt && dt->signature == ACPI_FACS_SIG) {
-					acpi_facs = (struct acpi_facs*) dt;
-				}
-				else {
-					acpi_unmap_table(dt);
-				}
-			}
+			// map DSDT if it exists
+			dt = acpi_map_table(facp->dsdt);
+			if (acpi_init_table(&acpi_dsdt, dt, 1))
+				acpi_unmap_table(dt);
+
+			break;
 		}
 		else {
 			acpi_unmap_table(dt);
 		}
+
 		rsdt_entry++;
 		rsdt_entry_count--;
 	}
 
 	acpi_unmap_table(rsdt);
 
-	if (!acpi_facp) {
+	if (!acpi_facp.table) {
 		printk(KERN_ERR "ACPI: missing FACP\n");
-		return -ENODEV;
+		return -EINVAL;
 	}
 	return 0;
 }
@@ -500,11 +677,9 @@ static int __init acpi_find_tables(void)
  */
 static void acpi_destroy_tables(void)
 {
-	if (!acpi_fake_facp)
-		acpi_unmap_table((struct acpi_table*) acpi_facp);
-	else
-		kfree(acpi_facp);
-	acpi_unmap_table((struct acpi_table*) acpi_facs);
+	acpi_destroy_table(&acpi_facs);
+	acpi_destroy_table(&acpi_dsdt);
+	acpi_destroy_table(&acpi_facp);
 }
 
 /*
@@ -512,6 +687,7 @@ static void acpi_destroy_tables(void)
  */
 static int __init acpi_init_piix4(struct pci_dev *dev)
 {
+	struct acpi_facp *facp;
 	u32 base;
 	u16 cmd;
 	u8 pmregmisc;
@@ -524,43 +700,40 @@ static int __init acpi_init_piix4(struct pci_dev *dev)
 	if (!(pmregmisc & ACPI_PIIX4_PMIOSE))
 		return -ENODEV;
 	
-	pci_read_config_dword(dev, 0x40, &base);
-	if (!(base & PCI_BASE_ADDRESS_SPACE_IO))
-		return -ENODEV;
-	
-	base &= PCI_BASE_ADDRESS_IO_MASK;
+	base = dev->resource[PCI_BRIDGE_RESOURCES].start & PCI_BASE_ADDRESS_IO_MASK;
 	if (!base)
 		return -ENODEV;
 
 	printk(KERN_INFO "ACPI: found PIIX4 at 0x%04x\n", base);
 
-	acpi_facp = kmalloc(sizeof(struct acpi_facp), GFP_KERNEL);
-	if (!acpi_facp)
+	facp = kmalloc(sizeof(struct acpi_facp), GFP_KERNEL);
+	if (!facp)
 		return -ENOMEM;
 
-	acpi_fake_facp = 1;
-	memset(acpi_facp, 0, sizeof(struct acpi_facp));
-	acpi_facp->int_model = ACPI_PIIX4_INT_MODEL;
-	acpi_facp->sci_int = ACPI_PIIX4_SCI_INT;
-	acpi_facp->smi_cmd = ACPI_PIIX4_SMI_CMD;
-	acpi_facp->acpi_enable = ACPI_PIIX4_ACPI_ENABLE;
-	acpi_facp->acpi_disable = ACPI_PIIX4_ACPI_DISABLE;
-	acpi_facp->s4bios_req = ACPI_PIIX4_S4BIOS_REQ;
-	acpi_facp->pm1a_evt = base + ACPI_PIIX4_PM1_EVT;
-	acpi_facp->pm1a_cnt = base + ACPI_PIIX4_PM1_CNT;
-	acpi_facp->pm2_cnt = ACPI_PIIX4_PM2_CNT;
-	acpi_facp->pm_tmr = base + ACPI_PIIX4_PM_TMR;
-	acpi_facp->gpe0 = base + ACPI_PIIX4_GPE0;
-	acpi_facp->pm1_evt_len = ACPI_PIIX4_PM1_EVT_LEN;
-	acpi_facp->pm1_cnt_len = ACPI_PIIX4_PM1_CNT_LEN;
-	acpi_facp->pm2_cnt_len = ACPI_PIIX4_PM2_CNT_LEN;
-	acpi_facp->pm_tm_len = ACPI_PIIX4_PM_TM_LEN;
-	acpi_facp->gpe0_len = ACPI_PIIX4_GPE0_LEN;
-	acpi_facp->p_lvl2_lat = (__u16) ACPI_INFINITE_LAT;
-	acpi_facp->p_lvl3_lat = (__u16) ACPI_INFINITE_LAT;
+	memset(facp, 0, sizeof(struct acpi_facp));
+	facp->hdr.signature = ACPI_FACP_SIG;
+	facp->hdr.length = sizeof(struct acpi_facp);
+	facp->int_model = ACPI_PIIX4_INT_MODEL;
+	facp->sci_int = ACPI_PIIX4_SCI_INT;
+	facp->smi_cmd = ACPI_PIIX4_SMI_CMD;
+	facp->acpi_enable = ACPI_PIIX4_ACPI_ENABLE;
+	facp->acpi_disable = ACPI_PIIX4_ACPI_DISABLE;
+	facp->s4bios_req = ACPI_PIIX4_S4BIOS_REQ;
+	facp->pm1a_evt = base + ACPI_PIIX4_PM1_EVT;
+	facp->pm1a_cnt = base + ACPI_PIIX4_PM1_CNT;
+	facp->pm2_cnt = ACPI_PIIX4_PM2_CNT;
+	facp->pm_tmr = base + ACPI_PIIX4_PM_TMR;
+	facp->gpe0 = base + ACPI_PIIX4_GPE0;
+	facp->pm1_evt_len = ACPI_PIIX4_PM1_EVT_LEN;
+	facp->pm1_cnt_len = ACPI_PIIX4_PM1_CNT_LEN;
+	facp->pm2_cnt_len = ACPI_PIIX4_PM2_CNT_LEN;
+	facp->pm_tm_len = ACPI_PIIX4_PM_TM_LEN;
+	facp->gpe0_len = ACPI_PIIX4_GPE0_LEN;
+	facp->p_lvl2_lat = (__u16) ACPI_INFINITE_LAT;
+	facp->p_lvl3_lat = (__u16) ACPI_INFINITE_LAT;
 
-	acpi_facp_addr = virt_to_phys(acpi_facp);
-	acpi_dsdt_addr = 0;
+	acpi_init_table(&acpi_facp, facp, 0);
+	acpi_init_table(&acpi_dsdt, NULL, 0);
 
 	acpi_p_blk = base + ACPI_PIIX4_P_BLK;
 
@@ -572,6 +745,7 @@ static int __init acpi_init_piix4(struct pci_dev *dev)
  */
 static int __init acpi_init_via(struct pci_dev *dev)
 {
+	struct acpi_facp *facp;
 	u32 base;
 	u8 tmp, irq;
 
@@ -579,54 +753,51 @@ static int __init acpi_init_via(struct pci_dev *dev)
 	if (!(tmp & 0x80))
 		return -ENODEV;
 
-	pci_read_config_byte(dev, PCI_CLASS_REVISION, &tmp);
-	tmp = (tmp & 0x10 ? 0x48 : 0x20);
-
-	pci_read_config_dword(dev, tmp, &base);
-	if (!(base & PCI_BASE_ADDRESS_SPACE_IO))
-		return -ENODEV;
-
+	base = pci_resource_start(dev, PCI_BRIDGE_RESOURCES);
+	if (!base) {
+		base = pci_resource_start(dev, PCI_BASE_ADDRESS_4);
+		if (!base)
+			return -ENODEV;
+	}
 	base &= PCI_BASE_ADDRESS_IO_MASK;
-	if (!base)
-		return -ENODEV;
 
 	pci_read_config_byte(dev, 0x42, &irq);
 
 	printk(KERN_INFO "ACPI: found %s at 0x%04x\n", dev->name, base);
 
-	acpi_facp = kmalloc(sizeof(struct acpi_facp), GFP_KERNEL);
-	if (!acpi_facp)
+	facp = kmalloc(sizeof(struct acpi_facp), GFP_KERNEL);
+	if (!facp)
 		return -ENOMEM;
 
-	acpi_fake_facp = 1;
-	memset(acpi_facp, 0, sizeof(struct acpi_facp));
+	memset(facp, 0, sizeof(struct acpi_facp));
+	facp->hdr.signature = ACPI_FACP_SIG;
+	facp->hdr.length = sizeof(struct acpi_facp);
+	facp->int_model = ACPI_VIA_INT_MODEL;
+	facp->sci_int = irq;
+	facp->smi_cmd = base + ACPI_VIA_SMI_CMD;
+	facp->acpi_enable = ACPI_VIA_ACPI_ENABLE;
+	facp->acpi_disable = ACPI_VIA_ACPI_DISABLE;
+	facp->pm1a_evt = base + ACPI_VIA_PM1_EVT;
+	facp->pm1a_cnt = base + ACPI_VIA_PM1_CNT;
+	facp->pm_tmr = base + ACPI_VIA_PM_TMR;
+	facp->gpe0 = base + ACPI_VIA_GPE0;
 
-	acpi_facp->int_model = ACPI_VIA_INT_MODEL;
-	acpi_facp->sci_int = irq;
-	acpi_facp->smi_cmd = base + ACPI_VIA_SMI_CMD;
-	acpi_facp->acpi_enable = ACPI_VIA_ACPI_ENABLE;
-	acpi_facp->acpi_disable = ACPI_VIA_ACPI_DISABLE;
-	acpi_facp->pm1a_evt = base + ACPI_VIA_PM1_EVT;
-	acpi_facp->pm1a_cnt = base + ACPI_VIA_PM1_CNT;
-	acpi_facp->pm_tmr = base + ACPI_VIA_PM_TMR;
-	acpi_facp->gpe0 = base + ACPI_VIA_GPE0;
+	facp->pm1_evt_len = ACPI_VIA_PM1_EVT_LEN;
+	facp->pm1_cnt_len = ACPI_VIA_PM1_CNT_LEN;
+	facp->pm_tm_len = ACPI_VIA_PM_TM_LEN;
+	facp->gpe0_len = ACPI_VIA_GPE0_LEN;
+	facp->p_lvl2_lat = (__u16) ACPI_INFINITE_LAT;
+	facp->p_lvl3_lat = (__u16) ACPI_INFINITE_LAT;
 
-	acpi_facp->pm1_evt_len = ACPI_VIA_PM1_EVT_LEN;
-	acpi_facp->pm1_cnt_len = ACPI_VIA_PM1_CNT_LEN;
-	acpi_facp->pm_tm_len = ACPI_VIA_PM_TM_LEN;
-	acpi_facp->gpe0_len = ACPI_VIA_GPE0_LEN;
-	acpi_facp->p_lvl2_lat = (__u16) ACPI_INFINITE_LAT;
-	acpi_facp->p_lvl3_lat = (__u16) ACPI_INFINITE_LAT;
+	facp->duty_offset = ACPI_VIA_DUTY_OFFSET;
+	facp->duty_width = ACPI_VIA_DUTY_WIDTH;
 
-	acpi_facp->duty_offset = ACPI_VIA_DUTY_OFFSET;
-	acpi_facp->duty_width = ACPI_VIA_DUTY_WIDTH;
+	facp->day_alarm = ACPI_VIA_DAY_ALARM;
+	facp->mon_alarm = ACPI_VIA_MON_ALARM;
+	facp->century = ACPI_VIA_CENTURY;
 
-	acpi_facp->day_alarm = ACPI_VIA_DAY_ALARM;
-	acpi_facp->mon_alarm = ACPI_VIA_MON_ALARM;
-	acpi_facp->century = ACPI_VIA_CENTURY;
-
-	acpi_facp_addr = virt_to_phys(acpi_facp);
-	acpi_dsdt_addr = 0;
+	acpi_init_table(&acpi_facp, facp, 0);
+	acpi_init_table(&acpi_dsdt, NULL, 0);
 
 	acpi_p_blk = base + ACPI_VIA_P_BLK;
 
@@ -658,7 +829,7 @@ const static struct pci_device_id acpi_pci_tbl[] =
 	{0x8086, 0x7113, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CH_INTEL_PIIX4},
 	{0x1106, 0x3040, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CH_VIA_586},
 	{0x1106, 0x3057, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CH_VIA_686A},
-	{0,}, /* terminate list */
+	{0,} /* terminate list */
 };
 
 static int __init acpi_probe(struct pci_dev *dev,
@@ -693,29 +864,27 @@ static int __init acpi_find_chipset(void)
  */
 static void acpi_irq(int irq, void *dev_id, struct pt_regs *regs)
 {
+	struct acpi_facp *facp = (struct acpi_facp*) acpi_facp.table;
 	u32 pm1_status, gpe_status, gpe_level, gpe_edge;
 	unsigned long flags;
 
 	// detect and clear fixed events
-	pm1_status = (acpi_read_pm1_status(acpi_facp)
-		      & acpi_read_pm1_enable(acpi_facp));
-	acpi_write_pm1_status(acpi_facp, pm1_status);
+	pm1_status = (acpi_read_pm1_status(facp) & acpi_read_pm1_enable(facp));
+	acpi_write_pm1_status(facp, pm1_status);
 	
 	// detect and handle general-purpose events
-	gpe_status = (acpi_read_gpe_status(acpi_facp)
-		      & acpi_read_gpe_enable(acpi_facp));
+	gpe_status = (acpi_read_gpe_status(facp) & acpi_read_gpe_enable(facp));
 	gpe_level = gpe_status & acpi_gpe_level;
 	if (gpe_level) {
 		// disable level-triggered events (re-enabled after handling)
-		acpi_write_gpe_enable(
-			acpi_facp,
-			acpi_read_gpe_enable(acpi_facp) & ~gpe_level);
+		acpi_write_gpe_enable(facp,
+				      acpi_read_gpe_enable(facp) & ~gpe_level);
 	}
 	gpe_edge = gpe_status & ~gpe_level;
 	if (gpe_edge) {
 		// clear edge-triggered events
-		while (acpi_read_gpe_status(acpi_facp) & gpe_edge)
-			acpi_write_gpe_status(acpi_facp, gpe_edge);
+		while (acpi_read_gpe_status(facp) & gpe_edge)
+			acpi_write_gpe_status(facp, gpe_edge);
 	}
 
 	// notify process waiting on /dev/acpi
@@ -725,6 +894,15 @@ static void acpi_irq(int irq, void *dev_id, struct pt_regs *regs)
 	spin_unlock_irqrestore(&acpi_event_lock, flags);
 	acpi_event_state = acpi_sleep_state;
 	wake_up_interruptible(&acpi_event_wait);
+}
+
+/*
+ * Is SCI to be enabled?
+ */
+static inline int
+acpi_sci_enabled(void)
+{
+	return !(acpi_opts & ACPI_SCI_DISABLED);
 }
 
 /*
@@ -740,7 +918,7 @@ static inline int acpi_is_enabled(struct acpi_facp *facp)
  */
 static int acpi_enable(struct acpi_facp *facp)
 {
-	if (facp->smi_cmd)
+	if (facp->smi_cmd && acpi_sci_enabled())
 		outb(facp->acpi_enable, facp->smi_cmd);
 	return (acpi_is_enabled(facp) ? 0:-1);
 }
@@ -750,16 +928,20 @@ static int acpi_enable(struct acpi_facp *facp)
  */
 static int acpi_disable(struct acpi_facp *facp)
 {
-	// disable and clear any pending events
-	acpi_write_gpe_enable(facp, 0);
-	while (acpi_read_gpe_status(facp))
-		acpi_write_gpe_status(facp, acpi_read_gpe_status(facp));
-	acpi_write_pm1_enable(facp, 0);
-	acpi_write_pm1_status(facp, acpi_read_pm1_status(facp));
+	if (facp->smi_cmd && acpi_sci_enabled()) {
+		// disable and clear any pending events
+		acpi_write_gpe_enable(facp, 0);
+		while (acpi_read_gpe_status(facp)) {
+			acpi_write_gpe_status(facp,
+					      acpi_read_gpe_status(facp));
+		}
+		acpi_write_pm1_enable(facp, 0);
+		acpi_write_pm1_status(facp, acpi_read_pm1_status(facp));
 
-	/* writing acpi_disable to smi_cmd would be appropriate
-	 * here but this causes a nasty crash on many systems
-	 */
+		/* writing acpi_disable to smi_cmd would be appropriate
+		 * here but this causes a nasty crash on many systems
+		 */
+	}
 
 	return 0;
 }
@@ -804,7 +986,7 @@ static void wake_on_busmaster(struct acpi_facp *facp)
 static void acpi_idle(void)
 {
 	static int sleep_level = 1;
-	struct acpi_facp *facp = acpi_facp;
+	struct acpi_facp *facp = (struct acpi_facp*) acpi_facp.table;
 
 	if (!facp || !facp->pm_tmr || !acpi_p_blk)
 		goto not_initialized;
@@ -819,7 +1001,7 @@ static void acpi_idle(void)
 sleep3:
 	sleep_level = 3;
 	if (!acpi_p_lvl3_tested) {
-		printk("ACPI C3 works\n");
+		printk(KERN_INFO "ACPI C3 works\n");
 		acpi_p_lvl3_tested = 1;
 	}
 	wake_on_busmaster(facp);
@@ -875,7 +1057,7 @@ sleep3_with_arbiter:
 sleep2:
 	sleep_level = 2;
 	if (!acpi_p_lvl2_tested) {
-		printk("ACPI C2 works\n");
+		printk(KERN_INFO "ACPI C2 works\n");
 		acpi_p_lvl2_tested = 1;
 	}
 	wake_on_busmaster(facp);	/* Required to track BM activity.. */
@@ -965,46 +1147,53 @@ static void acpi_update_clock(void)
 	}
 }
 
-
 /*
  * Enter system sleep state
  */
-static void acpi_enter_sx(acpi_sstate_t state)
+static int acpi_enter_sx(acpi_sstate_t state)
 {
-	unsigned long slp_typ = acpi_slp_typ[(int) state];
-	if (slp_typ != ACPI_SLP_TYP_DISABLED) {
-		u16 typa, typb, value;
+	unsigned long slp_typ;
+	u16 typa, typb, value;
+	struct acpi_facp *facp;
 
-		// bits 8-15 are SLP_TYPa, bits 0-7 are SLP_TYPb
-		typa = (slp_typ >> 8) & 0xff;
-		typb = slp_typ & 0xff;
+	slp_typ = acpi_slp_typ[(int) state];
+	if (slp_typ == ACPI_SLP_TYP_DISABLED)
+		return -EPERM;
 
-		typa = ((typa << ACPI_SLP_TYP_SHIFT) & ACPI_SLP_TYP_MASK);
-		typb = ((typb << ACPI_SLP_TYP_SHIFT) & ACPI_SLP_TYP_MASK);
+	// bits 8-15 are SLP_TYPa, bits 0-7 are SLP_TYPb
+	typa = (slp_typ >> 8) & 0xff;
+	typb = slp_typ & 0xff;
+	
+	typa = ((typa << ACPI_SLP_TYP_SHIFT) & ACPI_SLP_TYP_MASK);
+	typb = ((typb << ACPI_SLP_TYP_SHIFT) & ACPI_SLP_TYP_MASK);
 
-		acpi_sleep_start = get_cmos_time();
-		acpi_enter_dx(ACPI_D3);
-		acpi_sleep_state = state;
+	acpi_sleep_start = get_cmos_time();
+	acpi_enter_dx(ACPI_D3);
+	acpi_sleep_state = state;
 
-		// clear wake status
-		acpi_write_pm1_status(acpi_facp, ACPI_WAK);
-
-		// set SLP_TYPa/b and SLP_EN
-		if (acpi_facp->pm1a_cnt) {
-			value = inw(acpi_facp->pm1a_cnt) & ~ACPI_SLP_TYP_MASK;
-			outw(value | typa | ACPI_SLP_EN, acpi_facp->pm1a_cnt);
-		}
-		if (acpi_facp->pm1b_cnt) {
-			value = inw(acpi_facp->pm1b_cnt) & ~ACPI_SLP_TYP_MASK;
-			outw(value | typb | ACPI_SLP_EN, acpi_facp->pm1b_cnt);
-		}
-
-		// wait until S1 is entered
-		while (!(acpi_read_pm1_status(acpi_facp) & ACPI_WAK)) ;
-		// finished sleeping, update system time
-		acpi_update_clock();
-		acpi_enter_dx(ACPI_D0);
+	facp = (struct acpi_facp*) acpi_facp.table;
+	
+	// clear wake status
+	acpi_write_pm1_status(facp, ACPI_WAK);
+	
+	// set SLP_TYPa/b and SLP_EN
+	if (facp->pm1a_cnt) {
+		value = inw(facp->pm1a_cnt) & ~ACPI_SLP_TYP_MASK;
+		outw(value | typa | ACPI_SLP_EN, facp->pm1a_cnt);
 	}
+	if (facp->pm1b_cnt) {
+		value = inw(facp->pm1b_cnt) & ~ACPI_SLP_TYP_MASK;
+		outw(value | typb | ACPI_SLP_EN, facp->pm1b_cnt);
+	}
+	
+	// wait until S1 is entered
+	while (!(acpi_read_pm1_status(facp) & ACPI_WAK)) ;
+	// finished sleeping, update system time
+	acpi_update_clock();
+	acpi_enter_dx(ACPI_D0);
+	acpi_sleep_state = ACPI_S0;
+	
+	return 0;
 }
 
 /*
@@ -1071,6 +1260,42 @@ static int acpi_release_ioports(struct acpi_facp *facp)
 }
 
 /*
+ * Determine if modification of value is permitted
+ */
+static int
+acpi_verify_mod(int ctl_name)
+{
+	switch (ctl_name) {
+	case ACPI_PM1_ENABLE:
+	case ACPI_GPE_ENABLE:
+	case ACPI_GPE_LEVEL:
+		if (!acpi_sci_enabled())
+			return -EPERM;
+		break;
+	case ACPI_P_LVL2_LAT:
+	case ACPI_ENTER_LVL2_LAT:
+		if (acpi_opts & ACPI_C2_DISABLED)
+			return -EPERM;
+		break;
+	case ACPI_P_LVL3_LAT:
+	case ACPI_ENTER_LVL3_LAT:
+		if (acpi_opts & ACPI_C3_DISABLED)
+			return -EPERM;
+		break;
+	case ACPI_S1_SLP_TYP:
+	case ACPI_SLEEP:
+		if (acpi_opts & ACPI_S1_DISABLED)
+			return -EPERM;
+		break;
+	case ACPI_S5_SLP_TYP:
+		if (acpi_opts & ACPI_S5_DISABLED)
+			return -EPERM;
+		break;
+	}
+	return 0;
+}
+
+/*
  * Examine/modify value
  */
 static int acpi_do_ulong(ctl_table *ctl,
@@ -1099,6 +1324,9 @@ static int acpi_do_ulong(ctl_table *ctl,
 			*len = 0;
 	}
 	else {
+		if (acpi_verify_mod(ctl->ctl_name))
+			return -EPERM;
+
 		size = sizeof(str) - 1;
 		if (size > *len)
 			size = *len;
@@ -1115,6 +1343,120 @@ static int acpi_do_ulong(ctl_table *ctl,
 }
 
 /*
+ * Determine if user buffer contains a valid table
+ */
+static int acpi_verify_table(void *buffer,
+			     size_t size,
+			     struct acpi_table_info *info)
+{
+	if (size < sizeof(struct acpi_table))
+		return -EINVAL;
+	else if (verify_area(VERIFY_READ, buffer, size))
+		return -EFAULT;
+	else {
+		struct acpi_table hdr;
+		size_t table_size;
+
+		copy_from_user(&hdr, buffer, sizeof(hdr));
+		table_size = (size_t) hdr.length;
+		if (hdr.signature != info->expected_signature
+		    || table_size < size
+		    || (info->expected_size
+			&& table_size != info->expected_size))
+			return -EINVAL;
+	}
+	return 0;
+}
+
+/*
+ * Examine/replace an ACPI table
+ */
+static int acpi_do_table(ctl_table *ctl,
+			 int write,
+			 struct file *file,
+			 void *buffer,
+			 size_t *len)
+{
+	struct acpi_table_info *info = (struct acpi_table_info *) ctl->data;
+	u8 *data = NULL;
+	size_t size = 0;
+	int error = 0;
+
+	if (!info) {
+		*len = 0;
+		return 0;
+	}
+
+	if (!write) {
+		// table read
+		read_lock(&acpi_do_table_lock);
+		if (info->table && file->f_pos < info->size) {
+			data = (u8*) info->table + file->f_pos;
+			size = info->size - file->f_pos;
+			if (size > *len)
+				size = *len;
+			if (copy_to_user(buffer, data, size))
+				error = -EFAULT;
+		}
+		read_unlock(&acpi_do_table_lock);
+	}
+	else if (file->f_pos) {
+		// table body replacement
+		write_lock(&acpi_do_table_lock);
+		if (info->table && file->f_pos < info->size) {
+			data = (u8*) info->table + file->f_pos;
+			size = info->size - file->f_pos;
+			if (size > *len)
+				size = *len;
+			if (copy_from_user(data, buffer, size))
+				error = -EFAULT;
+		}
+		write_unlock(&acpi_do_table_lock);
+	}
+	else {
+		// table header/body replacement
+		struct acpi_table hdr;
+		size_t table_size;
+
+		// make sure we are being given a valid table
+		error = acpi_verify_table(buffer, *len, info);
+		if (error)
+			return error;
+		copy_from_user(&hdr, buffer, sizeof(hdr));
+		table_size = (size_t) hdr.length;
+		
+		write_lock(&acpi_do_table_lock);
+		
+		data = (u8*) info->table;
+		size = *len;
+		
+		if (!data || info->mapped || table_size != info->size) {
+			// allocate a (different sized) table
+			data = kmalloc(table_size, GFP_KERNEL);
+			if (data) {
+				memset(data, 0, table_size);
+				memcpy(data, &hdr, sizeof(hdr));
+				acpi_destroy_table(info);
+				acpi_init_table(info, data, 0);
+			}
+			else
+				error = -ENOMEM;
+		}
+		if (data)
+			copy_from_user(data, buffer, size);
+		
+		write_unlock(&acpi_do_table_lock);
+	}
+
+	if (error)
+		return error;
+
+	*len = size;
+	file->f_pos += size;
+	return 0;
+}
+
+/*
  * Examine/modify event register
  */
 static int acpi_do_event_reg(ctl_table *ctl,
@@ -1123,6 +1465,7 @@ static int acpi_do_event_reg(ctl_table *ctl,
 			     void *buffer,
 			     size_t *len)
 {
+	struct acpi_facp *facp = (struct acpi_facp*) acpi_facp.table;
 	char str[2 * sizeof(u32) + 4], *strend;
 	u32 val, enabling;
 	int size;
@@ -1136,10 +1479,10 @@ static int acpi_do_event_reg(ctl_table *ctl,
 		val = 0;
 		switch (ctl->ctl_name) {
 		case ACPI_PM1_ENABLE:
-			val = acpi_read_pm1_enable(acpi_facp);
+			val = acpi_read_pm1_enable(facp);
 			break;
 		case ACPI_GPE_ENABLE:
-			val = acpi_read_gpe_enable(acpi_facp);
+			val = acpi_read_gpe_enable(facp);
 			break;
 		case ACPI_GPE_LEVEL:
 			val = acpi_gpe_level;
@@ -1156,6 +1499,9 @@ static int acpi_do_event_reg(ctl_table *ctl,
 	}
 	else
 	{
+		if (acpi_verify_mod(ctl->ctl_name))
+			return -EPERM;
+
 		// fetch user value
 		size = sizeof(str) - 1;
 		if (size > *len)
@@ -1170,42 +1516,41 @@ static int acpi_do_event_reg(ctl_table *ctl,
 		switch (ctl->ctl_name) {
 		case ACPI_PM1_ENABLE:
 			// clear previously disabled events
-			enabling = (val
-				    & ~acpi_read_pm1_enable(acpi_facp));
-			acpi_write_pm1_status(acpi_facp, enabling);
+			enabling = (val & ~acpi_read_pm1_enable(facp));
+			acpi_write_pm1_status(facp, enabling);
 			
 			if (val) {
 				// enable ACPI unless it is already
-				if (!acpi_is_enabled(acpi_facp))
-					acpi_enable(acpi_facp);
+				if (!acpi_is_enabled(facp))
+					acpi_enable(facp);
 			}
-			else if (!acpi_read_gpe_enable(acpi_facp)) {
+			else if (!acpi_read_gpe_enable(facp)) {
 				// disable ACPI unless it is already
-				if (acpi_is_enabled(acpi_facp))
-					acpi_disable(acpi_facp);
+				if (acpi_is_enabled(facp))
+					acpi_disable(facp);
 			}
 			
-			acpi_write_pm1_enable(acpi_facp, val);
+			acpi_write_pm1_enable(facp, val);
 			break;
 		case ACPI_GPE_ENABLE:
 			// clear previously disabled events
 			enabling = (val
-				    & ~acpi_read_gpe_enable(acpi_facp));
-			while (acpi_read_gpe_status(acpi_facp) & enabling)
-				acpi_write_gpe_status(acpi_facp, enabling);
+				    & ~acpi_read_gpe_enable(facp));
+			while (acpi_read_gpe_status(facp) & enabling)
+				acpi_write_gpe_status(facp, enabling);
 			
 			if (val) {
 				// enable ACPI unless it is already
-				if (!acpi_is_enabled(acpi_facp))
-					acpi_enable(acpi_facp);
+				if (!acpi_is_enabled(facp))
+					acpi_enable(facp);
 			}
-			else if (!acpi_read_pm1_enable(acpi_facp)) {
+			else if (!acpi_read_pm1_enable(facp)) {
 				// disable ACPI unless it is already
-				if (acpi_is_enabled(acpi_facp))
-					acpi_disable(acpi_facp);
+				if (acpi_is_enabled(facp))
+					acpi_disable(facp);
 			}
 			
-			acpi_write_gpe_enable(acpi_facp, val);
+			acpi_write_gpe_enable(facp, val);
 			break;
 		case ACPI_GPE_LEVEL:
 			acpi_gpe_level = val;
@@ -1287,37 +1632,93 @@ static int acpi_do_sleep(ctl_table *ctl,
 	}
 	else
 	{
-#ifdef CONFIG_ACPI_S1_SLEEP
-		acpi_enter_sx(ACPI_S1);
-#endif
+		if (acpi_verify_mod(ctl->ctl_name) || acpi_enter_sx(ACPI_S1))
+			return -EPERM;
 	}
 	file->f_pos += *len;
 	return 0;
 }
 
+/*
+ * Parse command line options
+ */
+static int __init acpi_setup(char *str)
+{
+	while (str && *str) {
+		struct acpi_option_info *opt = acpi_options;
+		while (opt->name) {
+			if (!strncmp(str, opt->name, strlen(opt->name))) {
+				acpi_opts |= opt->value;
+				break;
+			}
+			opt++;
+		}
+		str = strpbrk(str, ",");
+		if (str)
+			str += strspn(str, ",");
+	}
+
+	if (acpi_opts)
+		printk(KERN_INFO "ACPI: options 0x%08lx\n", acpi_opts);
+
+	return 1;
+}
+
+/*
+ * kernel/module command line interfaces are both "acpi=OPTION,OPTION,..."
+ */
+__setup("acpi=", acpi_setup);
+
+static char * __initdata acpi = NULL;
+
+MODULE_DESCRIPTION("ACPI driver");
+MODULE_PARM(acpi, "s");
+MODULE_PARM_DESC(acpi, "ACPI driver command line");
 
 /*
  * Initialize and enable ACPI
  */
-static int __init acpi_init(void)
+int __init acpi_init(void)
 {
-	switch(acpi_enabled)
-	{
-	case ACPI_ENABLED:
-		if (acpi_find_tables() && acpi_find_chipset())
-			return -ENODEV;
-		break;
-	case ACPI_TABLES_ONLY:
-		if (acpi_find_tables())
-			return -ENODEV;
-		break;
-	case ACPI_CHIPSET_ONLY:
-		if (acpi_find_chipset())
-			return -ENODEV;
-		break;
-	case ACPI_DISABLED:
+	struct acpi_facp *facp = NULL;
+
+	if (acpi)
+		acpi_setup(acpi);
+
+	if (acpi_opts & ACPI_DISABLED) {
 		return -ENODEV;
 	}
+	else if (acpi_opts & ACPI_TABLES_ONLY) {
+		if (acpi_find_tables())
+			return -ENODEV;
+	}
+	else if (acpi_opts & ACPI_CHIPSET_ONLY) {
+		if (acpi_find_chipset())
+			return -ENODEV;
+	}
+	else {
+		switch (acpi_find_tables()) {
+		case 0:
+			// found valid ACPI tables
+			break;
+		case -ENODEV:
+			// found no ACPI tables, try chipset-specific
+			if (acpi_find_chipset())
+				return -ENODEV;
+			break;
+		default:
+			// found broken ACPI tables
+			return -ENODEV;
+		}
+	}
+
+	facp = (struct acpi_facp*) acpi_facp.table;
+
+	if (PM_IS_ACTIVE()) {
+		printk(KERN_NOTICE "acpi: APM is already active.\n");
+		goto err_out;
+	}
+	pm_active = 1;
 
 	/*
 	 * Internally we always keep latencies in timer
@@ -1325,39 +1726,44 @@ static int __init acpi_init(void)
 	 * an uS to us?). Besides, that gives people more
 	 * control in the /proc interfaces.
 	 */
-	if (acpi_facp->p_lvl2_lat
-	    && acpi_facp->p_lvl2_lat <= ACPI_MAX_P_LVL2_LAT) {
-		acpi_p_lvl2_lat = ACPI_uS_TO_TMR_TICKS(acpi_facp->p_lvl2_lat);
+	if (facp->p_lvl2_lat
+	    && facp->p_lvl2_lat <= ACPI_MAX_P_LVL2_LAT
+	    && !acpi_verify_mod(ACPI_P_LVL2_LAT)) {
+		acpi_p_lvl2_lat = ACPI_uS_TO_TMR_TICKS(facp->p_lvl2_lat);
 		acpi_enter_lvl2_lat = ACPI_uS_TO_TMR_TICKS(ACPI_TMR_HZ / 1000);
 	}
-	if (acpi_facp->p_lvl3_lat
-	    && acpi_facp->p_lvl3_lat <= ACPI_MAX_P_LVL3_LAT) {
-		acpi_p_lvl3_lat = ACPI_uS_TO_TMR_TICKS(acpi_facp->p_lvl3_lat);
+	if (facp->p_lvl3_lat
+	    && facp->p_lvl3_lat <= ACPI_MAX_P_LVL3_LAT
+	    && !acpi_verify_mod(ACPI_P_LVL3_LAT)) {
+		acpi_p_lvl3_lat = ACPI_uS_TO_TMR_TICKS(facp->p_lvl3_lat);
 		acpi_enter_lvl3_lat
-			= ACPI_uS_TO_TMR_TICKS(acpi_facp->p_lvl3_lat * 5);
+			= ACPI_uS_TO_TMR_TICKS(facp->p_lvl3_lat * 5);
 	}
 
-	if (acpi_claim_ioports(acpi_facp)) {
+	if (acpi_claim_ioports(facp)) {
 		printk(KERN_ERR "ACPI: I/O port allocation failed\n");
 		goto err_out;
 	}
 
-	if (acpi_facp->sci_int
-	    && request_irq(acpi_facp->sci_int,
+	if (facp->sci_int
+	    && acpi_sci_enabled()
+	    && request_irq(facp->sci_int,
 			   acpi_irq,
 			   SA_INTERRUPT | SA_SHIRQ,
 			   "acpi",
-			   acpi_facp)) {
+			   &acpi_facp)) {
 		printk(KERN_ERR "ACPI: SCI (IRQ%d) allocation failed\n",
-		       acpi_facp->sci_int);
+		       facp->sci_int);
 		goto err_out;
 	}
+
+#ifndef CONFIG_ACPI_S1_SLEEP
+	acpi_opts |= ACPI_S1_DISABLED;
+#endif
 
 	acpi_sysctl = register_sysctl_table(acpi_dir_table, 1);
 
 	pm_power_off = acpi_power_off;
-
-	pm_active = 1;
 
 	/*
 	 * Set up the ACPI idle function. Note that we can't really
@@ -1369,7 +1775,7 @@ static int __init acpi_init(void)
 		return 0;
 #endif
 
-	if (acpi_facp->pm_tmr)
+	if (facp->pm_tmr)
 		pm_idle = acpi_idle;
 
 	return 0;
@@ -1385,47 +1791,27 @@ err_out:
 /*
  * Disable and deinitialize ACPI
  */
-static void __exit acpi_exit(void)
+void __exit acpi_exit(void)
 {
+	struct acpi_facp *facp = (struct acpi_facp*) acpi_facp.table;
+
 	pm_idle = NULL;
-	pm_active = 0;
 	pm_power_off = NULL;
 
 	unregister_sysctl_table(acpi_sysctl);
-	acpi_disable(acpi_facp);
-	acpi_release_ioports(acpi_facp);
+	acpi_disable(facp);
+	acpi_release_ioports(facp);
 
-	if (acpi_facp->sci_int)
-		free_irq(acpi_facp->sci_int, acpi_facp);
+	if (facp->sci_int && acpi_sci_enabled())
+		free_irq(facp->sci_int, &acpi_facp);
 
 	acpi_destroy_tables();
 
 	if (pci_driver_registered)
 		pci_unregister_driver(&acpi_driver);
-}
 
-/*
- * Parse kernel command line options
- */
-static int __init acpi_setup(char *str)
-{
-	while (str && *str) {
-		if (strncmp(str, "on", 2) == 0)
-			acpi_enabled = ACPI_ENABLED;
-		else if (strncmp(str, "tables", 6) == 0)
-			acpi_enabled = ACPI_TABLES_ONLY;
-		else if (strncmp(str, "chipset", 7) == 0)
-			acpi_enabled = ACPI_CHIPSET_ONLY;
-		else if (strncmp(str, "off", 3) == 0)
-			acpi_enabled = ACPI_DISABLED;
-		str = strpbrk(str, ",");
-		if (str)
-			str += strspn(str, ",");
-	}
-	return 1;
+	pm_active = 0;
 }
-
-__setup("acpi=", acpi_setup);
 
 module_init(acpi_init);
 module_exit(acpi_exit);
